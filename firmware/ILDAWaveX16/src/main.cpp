@@ -12,6 +12,7 @@
 #include "driver/timer.h"
 #include <Preferences.h>
 #include "esp_task_wdt.h"
+#include "wifi_credentials.h"
 
 using namespace std;
 
@@ -35,8 +36,8 @@ void init_wifi() {
   preferences.end();
 
   if (ssid == "" || password == ""){
-    ssid = "{default_ssid}";
-    password = "{default_pass}";
+    ssid = WIFI_SSID;
+    password = WIFI_PASSWORD;
   }
 
   WiFi.mode(WIFI_AP_STA);
