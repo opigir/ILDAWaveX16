@@ -13,8 +13,15 @@
 #include <Preferences.h>
 #include "esp_task_wdt.h"
 #include "wifi_credentials.h"
+#include <ESPmDNS.h>
 
 using namespace std;
+
+// Serial buffer for web interface - circular buffer to prevent memory fragmentation
+char serialBuffer[3000];
+int serialHead = 0;
+int serialSize = 0;
+const int MAX_SERIAL_BUFFER = 3000;
 
 Preferences preferences;
 Adafruit_NeoPixel pixels(1, PIN_LED, NEO_GRB + NEO_KHZ800);
@@ -25,6 +32,50 @@ File current_file;
 
 IDNServer idn;
 IWPServer iwp;
+
+// Function to add text to serial buffer for web display
+void addToSerialBuffer(String text) {
+  for (int i = 0; i < text.length(); i++) {
+    serialBuffer[serialHead] = text[i];
+    serialHead = (serialHead + 1) % MAX_SERIAL_BUFFER;
+    if (serialSize < MAX_SERIAL_BUFFER) {
+      serialSize++;
+    }
+  }
+}
+
+// Function to get serial buffer as String for web interface
+String getSerialBuffer() {
+  String result = "";
+  result.reserve(serialSize + 1);
+
+  if (serialSize < MAX_SERIAL_BUFFER) {
+    // Buffer not full yet, read from beginning
+    for (int i = 0; i < serialSize; i++) {
+      result += serialBuffer[i];
+    }
+  } else {
+    // Buffer is full, read from head to end, then from beginning to head
+    for (int i = serialHead; i < MAX_SERIAL_BUFFER; i++) {
+      result += serialBuffer[i];
+    }
+    for (int i = 0; i < serialHead; i++) {
+      result += serialBuffer[i];
+    }
+  }
+  return result;
+}
+
+// Custom print functions that also store in buffer
+void webSerial(String text) {
+  Serial.print(text);
+  addToSerialBuffer(text);
+}
+
+void webSerialln(String text) {
+  Serial.println(text);
+  addToSerialBuffer(text + "\n");
+}
 
 void init_wifi() {
   String ssid;
@@ -43,20 +94,31 @@ void init_wifi() {
   WiFi.mode(WIFI_AP_STA);
 
   WiFi.softAP("ILDAWaveX16", "ildawave");
-  Serial.print("AP IP address: ");
-  Serial.println(WiFi.softAPIP());
+  webSerial("AP IP address: ");
+  webSerialln(WiFi.softAPIP().toString());
 
   WiFi.begin(ssid, password);
-  Serial.print(F("Connecting to WiFi"));
-  
+  webSerial("Connecting to WiFi");
+
   uint8_t attempts = 0;
   while (WiFi.status() != WL_CONNECTED && attempts < 20) {
       delay(500);
-      Serial.print(F("."));
+      webSerial(".");
       attempts++;
   }
-  if (WiFi.status() == WL_CONNECTED) Serial.printf("\nLocal IP: %s\n", WiFi.localIP().toString().c_str());
-  else Serial.println("\nWiFi Connection Failed!");
+  if (WiFi.status() == WL_CONNECTED) {
+    webSerial("\nLocal IP: ");
+    webSerialln(WiFi.localIP().toString());
+
+    // Start mDNS service
+    if (MDNS.begin("ildawavex16")) {
+      webSerialln("mDNS responder started: ildawavex16.local");
+      MDNS.addService("http", "tcp", 80);
+    } else {
+      webSerialln("Error starting mDNS");
+    }
+  }
+  else webSerialln("\nWiFi Connection Failed!");
 }
 
 const char index_html[] PROGMEM = R"rawliteral(
@@ -102,10 +164,76 @@ const char index_html[] PROGMEM = R"rawliteral(
 <button onclick="setWiFi()">Save &amp; Connect</button>
 </div>
 </div>
+<div class="card">
+<div class="card-title">&#128196; Serial Monitor</div>
+<div id="serialOutput" style="height:12em;overflow-y:auto;background:var(--primary);border-radius:var(--radius);padding:0.75em;font-family:monospace;font-size:0.85em;line-height:1.2em;white-space:pre-wrap;border:1px solid var(--border);"></div>
+<div class="btn-row">
+<button onclick="clearSerial()">Clear</button>
+<button onclick="toggleAutoUpdate()" id="autoUpdateBtn">Auto-update: ON</button>
+</div>
+</div>
 </main>
 <footer><a href="https://stanleyprojects.com/" style="color:inherit;text-decoration:none" target="_blank" rel="noopener noreferrer">StanleyProjects</a> | VER 0.1</footer>
 <script>
-let s=null;document.addEventListener("DOMContentLoaded",()=>{document.querySelectorAll("#fileTable tr").forEach((r,i)=>{if(!i)return;r.onclick=()=>{document.querySelectorAll("#fileTable tr").forEach(x=>x.classList.remove("selected"));r.classList.add("selected");s=r.dataset.filename};r.ondblclick=()=>{s=r.dataset.filename;playFile()}})});function playFile(){if(!s){alert("Select a file.");return}fetch(`/play?file=${encodeURIComponent(s)}&rate=${document.getElementById("scanRate").value}`)}function stopFile(){fetch("/stop")}function updateSettings(){const r=document.getElementById("scanRate"),b=document.getElementById("brightness");document.getElementById("rateValue").textContent=r.value;document.getElementById("brightnessValue").textContent=b.value;fetch(`/control?rate=${r.value}&brightness=${b.value}`).catch(console.error)}function setWiFi(){fetch(`/set_wifi?ssid=${encodeURIComponent(document.getElementById("ssid").value)}&pass=${encodeURIComponent(document.getElementById("pass").value)}`)}
+let s=null,autoUpdate=true,updateInterval;
+
+document.addEventListener("DOMContentLoaded",()=>{
+  document.querySelectorAll("#fileTable tr").forEach((r,i)=>{
+    if(!i)return;
+    r.onclick=()=>{
+      document.querySelectorAll("#fileTable tr").forEach(x=>x.classList.remove("selected"));
+      r.classList.add("selected");
+      s=r.dataset.filename
+    };
+    r.ondblclick=()=>{s=r.dataset.filename;playFile()}
+  });
+  startSerialUpdate()
+});
+
+function playFile(){
+  if(!s){alert("Select a file.");return}
+  fetch(`/play?file=${encodeURIComponent(s)}&rate=${document.getElementById("scanRate").value}`)
+}
+
+function stopFile(){
+  fetch("/stop")
+}
+
+function updateSettings(){
+  const r=document.getElementById("scanRate"),b=document.getElementById("brightness");
+  document.getElementById("rateValue").textContent=r.value;
+  document.getElementById("brightnessValue").textContent=b.value;
+  fetch(`/control?rate=${r.value}&brightness=${b.value}`).catch(console.error)
+}
+
+function setWiFi(){
+  fetch(`/set_wifi?ssid=${encodeURIComponent(document.getElementById("ssid").value)}&pass=${encodeURIComponent(document.getElementById("pass").value)}`)
+}
+
+function updateSerial(){
+  fetch("/serial").then(r=>r.text()).then(data=>{
+    const out=document.getElementById("serialOutput");
+    const wasAtBottom=out.scrollTop>=out.scrollHeight-out.clientHeight-5;
+    out.textContent=data;
+    if(wasAtBottom)out.scrollTop=out.scrollHeight
+  }).catch(console.error)
+}
+
+function clearSerial(){
+  fetch("/clear_serial");
+  document.getElementById("serialOutput").textContent=""
+}
+
+function toggleAutoUpdate(){
+  autoUpdate=!autoUpdate;
+  document.getElementById("autoUpdateBtn").textContent=`Auto-update: ${autoUpdate?"ON":"OFF"}`;
+  if(autoUpdate)startSerialUpdate();else clearInterval(updateInterval)
+}
+
+function startSerialUpdate(){
+  updateSerial();
+  updateInterval=setInterval(updateSerial,1000)
+}
 </script>
 </body>
 </html>
@@ -198,6 +326,16 @@ void setupServer() {
 
     request->send(200, "text/plain", "Wi-Fi settings saved. Restarting.");
     ESP.restart();
+  });
+
+  server.on("/serial", HTTP_GET, [](AsyncWebServerRequest *request) {
+    request->send(200, "text/plain", getSerialBuffer());
+  });
+
+  server.on("/clear_serial", HTTP_GET, [](AsyncWebServerRequest *request) {
+    serialHead = 0;
+    serialSize = 0;
+    request->send(200, "text/plain", "Serial buffer cleared");
   });
 
   server.begin();
