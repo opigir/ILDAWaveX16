@@ -14,6 +14,7 @@
 #include "esp_task_wdt.h"
 #include "wifi_credentials.h"
 #include <ESPmDNS.h>
+#include <ElegantOTA.h>
 
 using namespace std;
 
@@ -32,6 +33,8 @@ File current_file;
 
 IDNServer idn;
 IWPServer iwp;
+
+String currentlyPlayingFile = "";
 
 // Function to add text to serial buffer for web display
 void addToSerialBuffer(String text) {
@@ -80,10 +83,12 @@ void webSerialln(String text) {
 void init_wifi() {
   String ssid;
   String password;
+  String mdns_name;
 
-  preferences.begin("app", false); 
-  ssid = preferences.getString("ssid", ""); 
+  preferences.begin("app", false);
+  ssid = preferences.getString("ssid", "");
   password = preferences.getString("password", "");
+  mdns_name = preferences.getString("mdns_name", "ildawavex16");
   preferences.end();
 
   if (ssid == "" || password == ""){
@@ -111,8 +116,10 @@ void init_wifi() {
     webSerialln(WiFi.localIP().toString());
 
     // Start mDNS service
-    if (MDNS.begin("ildawavex16")) {
-      webSerialln("mDNS responder started: ildawavex16.local");
+    if (MDNS.begin(mdns_name.c_str())) {
+      webSerial("mDNS responder started: ");
+      webSerial(mdns_name);
+      webSerialln(".local");
       MDNS.addService("http", "tcp", 80);
     } else {
       webSerialln("Error starting mDNS");
@@ -129,12 +136,18 @@ const char index_html[] PROGMEM = R"rawliteral(
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>SD Player</title>
 <style>
-*{box-sizing:border-box}:root{--bg:#1a1a1f;--surface:#252530;--primary:#32323f;--accent:#4a9eff;--text:#e8e8ec;--text-dim:#8888a0;--border:#3a3a48;--radius:0.5em}html,body{margin:0;padding:0;min-height:100%}body{font-family:system-ui,-apple-system,sans-serif;background:var(--bg);color:var(--text);line-height:1.5}main{max-width:60em;margin:0 auto;padding:1em}h2{text-align:center;margin:.5em 0 1em;font-size:1.5em;background:linear-gradient(90deg,red,#ff8000,#ff0,#0f0,#0ff,#0080ff,#8000ff,#ff0080,red);background-size:200% 100%;-webkit-background-clip:text;background-clip:text;color:transparent;animation:r 3s linear infinite}@keyframes r{to{background-position:200% 50%}}.card{background:var(--surface);border-radius:var(--radius);padding:1em;margin-bottom:1em}.card-title{font-weight:600;margin-bottom:.75em;padding-bottom:.5em;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:.5em}#tableContainer{max-height:12em;overflow-y:auto;border-radius:var(--radius);background:var(--primary)}table{width:100%;border-collapse:collapse}th,td{padding:.6em .8em;text-align:left}th{background:var(--bg);position:sticky;top:0;font-size:.85em;text-transform:uppercase;color:var(--text-dim)}tr:not(:last-child) td{border-bottom:1px solid var(--border)}tr:hover td{background:rgba(74,158,255,.1)}tr.selected td{background:rgba(74,158,255,.25)}.btn-row{display:flex;gap:.5em;margin-top:1em;flex-wrap:wrap}button{flex:1;min-width:6em;padding:.75em 1em;border:none;border-radius:var(--radius);background:var(--primary);color:var(--text);font-size:1em;cursor:pointer;transition:background .2s,transform .1s}button:hover{background:var(--accent)}button:active{transform:scale(.97)}.control-group{margin-bottom:1em}.control-group:last-child{margin-bottom:0}.control-label{display:flex;justify-content:space-between;margin-bottom:.3em;font-size:.9em}.control-value{color:var(--accent);font-weight:600}input[type=range]{width:100%;height:.4em;border-radius:.2em;background:var(--primary);outline:none;-webkit-appearance:none}input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:1.2em;height:1.2em;border-radius:50%;background:var(--accent);cursor:pointer}input[type=range]::-moz-range-thumb{width:1.2em;height:1.2em;border-radius:50%;background:var(--accent);cursor:pointer;border:none}.input-group{display:flex;flex-direction:column;gap:.5em}input[type=text]{width:100%;padding:.7em;border:1px solid var(--border);border-radius:var(--radius);background:var(--primary);color:var(--text);font-size:1em}input[type=text]:focus{outline:2px solid var(--accent);outline-offset:-2px}input[type=text]::placeholder{color:var(--text-dim)}footer{text-align:center;padding:1em;color:var(--text-dim);font-size:.8em}@media(max-width:30em){main{padding:.5em}.card{padding:.8em}th,td{padding:.5em;font-size:.9em}}
+*{box-sizing:border-box}:root{--bg:#1a1a1f;--surface:#252530;--primary:#32323f;--accent:#4a9eff;--text:#e8e8ec;--text-dim:#8888a0;--border:#3a3a48;--radius:0.5em}html,body{margin:0;padding:0;min-height:100%}body{font-family:system-ui,-apple-system,sans-serif;background:var(--bg);color:var(--text);line-height:1.5}main{max-width:60em;margin:0 auto;padding:1em}h2{text-align:center;margin:.5em 0 0;font-size:1.5em;background:linear-gradient(90deg,red,#ff8000,#ff0,#0f0,#0ff,#0080ff,#8000ff,#ff0080,red);background-size:200% 100%;-webkit-background-clip:text;background-clip:text;color:transparent;animation:r 3s linear infinite}@keyframes r{to{background-position:200% 50%}}.card{background:var(--surface);border-radius:var(--radius);padding:1em;margin-bottom:1em}.card-title{font-weight:600;margin-bottom:.75em;padding-bottom:.5em;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:.5em}#tableContainer{max-height:12em;overflow-y:auto;border-radius:var(--radius);background:var(--primary)}table{width:100%;border-collapse:collapse}th,td{padding:.6em .8em;text-align:left}th{background:var(--bg);position:sticky;top:0;font-size:.85em;text-transform:uppercase;color:var(--text-dim)}tr:not(:last-child) td{border-bottom:1px solid var(--border)}tr:hover td{background:rgba(74,158,255,.1)}tr.selected td{background:rgba(74,158,255,.25)}.btn-row{display:flex;gap:.5em;margin-top:1em;flex-wrap:wrap}button{flex:1;min-width:6em;padding:.75em 1em;border:none;border-radius:var(--radius);background:var(--primary);color:var(--text);font-size:1em;cursor:pointer;transition:background .2s,transform .1s}button:hover{background:var(--accent)}button:active{transform:scale(.97)}.control-group{margin-bottom:1em}.control-group:last-child{margin-bottom:0}.control-label{display:flex;justify-content:space-between;margin-bottom:.3em;font-size:.9em}.control-value{color:var(--accent);font-weight:600}input[type=range]{width:100%;height:.4em;border-radius:.2em;background:var(--primary);outline:none;-webkit-appearance:none}input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:1.2em;height:1.2em;border-radius:50%;background:var(--accent);cursor:pointer}input[type=range]::-moz-range-thumb{width:1.2em;height:1.2em;border-radius:50%;background:var(--accent);cursor:pointer;border:none}.input-group{display:flex;flex-direction:column;gap:.5em}input[type=text]{width:100%;padding:.7em;border:1px solid var(--border);border-radius:var(--radius);background:var(--primary);color:var(--text);font-size:1em;transition:border-color .2s}input[type=text]:focus{outline:2px solid var(--accent);outline-offset:-2px}input[type=text]::placeholder{color:var(--text-dim)}input[type=text].invalid{border-color:#ff4444}input[type=text].valid{border-color:#44ff44}button:disabled{opacity:0.6;cursor:not-allowed}footer{text-align:center;padding:1em;color:var(--text-dim);font-size:.8em}@media(max-width:30em){main{padding:.5em}.card{padding:.8em}th,td{padding:.5em;font-size:.9em}}
 </style>
 </head>
 <body>
 <main>
 <h2>&#9889; ILDAWaveX16 &#9889;</h2>
+<div id="deviceInfo" style="text-align:center;margin-bottom:1em;padding:0.5em;font-size:0.85em;color:var(--text-dim);">
+<div>IP: <span id="deviceIP">Loading...</span> | mDNS: <span id="deviceMDNS">Loading...</span>.local</div>
+</div>
+<div id="nowPlaying" style="display:none;text-align:center;margin-bottom:1em;padding:0.75em;background:linear-gradient(90deg,var(--accent),var(--primary));border-radius:var(--radius);font-weight:600;">
+<div>&#9654; Now Playing: <span id="currentFile"></span></div>
+</div>
 <div class="card">
 <div class="card-title">&#128194; SD Card</div>
 <div id="tableContainer">
@@ -157,19 +170,41 @@ const char index_html[] PROGMEM = R"rawliteral(
 </div>
 </div>
 <div class="card">
-<div class="card-title">&#128246; Wi-Fi Settings</div>
+<div class="card-title" style="cursor:pointer;" onclick="toggleSettings()">&#9881; Settings <span id="settingsToggle">&#9660;</span></div>
+<div id="settingsContainer">
+<div style="padding:1em;">
+<div style="font-weight:600;margin-bottom:0.75em;padding-bottom:0.5em;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:0.5em;">&#128246; Wi-Fi Settings</div>
 <div class="input-group">
 <input type="text" id="ssid" placeholder="SSID">
 <input type="text" id="pass" placeholder="Password">
 <button onclick="setWiFi()">Save &amp; Connect</button>
 </div>
 </div>
-<div class="card">
-<div class="card-title">&#128196; Serial Monitor</div>
+<div style="padding:1em;">
+<div style="font-weight:600;margin-bottom:0.75em;padding-bottom:0.5em;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:0.5em;">&#127760; Network Name - DNS</div>
+<div class="input-group">
+<div style="display:flex;align-items:center;gap:0.5em;margin-bottom:0.5em;">
+<input type="text" id="mdns_name" placeholder="e.g. laser1" style="flex:1;">
+<span style="color:var(--text-dim);font-size:0.9em;">.local</span>
+</div>
+<button onclick="setMDNS()">Save & Restart</button>
+</div>
+</div>
+<div style="padding:1em;">
+<div style="cursor:pointer;font-weight:600;margin-bottom:0.75em;padding-bottom:0.5em;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:0.5em;" onclick="toggleSerial()">&#128196; Serial Monitor <span id="serialToggle">&#9660;</span></div>
+<div id="serialContainer">
 <div id="serialOutput" style="height:12em;overflow-y:auto;background:var(--primary);border-radius:var(--radius);padding:0.75em;font-family:monospace;font-size:0.85em;line-height:1.2em;white-space:pre-wrap;border:1px solid var(--border);"></div>
 <div class="btn-row">
 <button onclick="clearSerial()">Clear</button>
 <button onclick="toggleAutoUpdate()" id="autoUpdateBtn">Auto-update: ON</button>
+</div>
+</div>
+</div>
+<div style="padding:1em;">
+<div class="btn-row">
+<button onclick="window.open('/update', '_blank')">&#8593; OTA Update</button>
+</div>
+</div>
 </div>
 </div>
 </main>
@@ -187,16 +222,42 @@ document.addEventListener("DOMContentLoaded",()=>{
     };
     r.ondblclick=()=>{s=r.dataset.filename;playFile()}
   });
-  startSerialUpdate()
+  startSerialUpdate();
+  loadMDNSName();
+  loadDeviceInfo();
+  setInterval(loadDeviceInfo, 5000)
 });
+
+function loadMDNSName(){
+  fetch("/get_mdns").then(r=>r.text()).then(name=>{
+    document.getElementById("mdns_name").value=name
+  }).catch(console.error)
+}
+
+function loadDeviceInfo(){
+  fetch("/get_device_info").then(r=>r.json()).then(data=>{
+    document.getElementById("deviceIP").textContent=data.ip;
+    document.getElementById("deviceMDNS").textContent=data.mdns;
+
+    const nowPlaying=document.getElementById("nowPlaying");
+    const currentFile=document.getElementById("currentFile");
+
+    if(data.playing){
+      currentFile.textContent=data.playing;
+      nowPlaying.style.display="block"
+    }else{
+      nowPlaying.style.display="none"
+    }
+  }).catch(console.error)
+}
 
 function playFile(){
   if(!s){alert("Select a file.");return}
-  fetch(`/play?file=${encodeURIComponent(s)}&rate=${document.getElementById("scanRate").value}`)
+  fetch(`/play?file=${encodeURIComponent(s)}&rate=${document.getElementById("scanRate").value}`).then(()=>loadDeviceInfo())
 }
 
 function stopFile(){
-  fetch("/stop")
+  fetch("/stop").then(()=>loadDeviceInfo())
 }
 
 function updateSettings(){
@@ -206,8 +267,89 @@ function updateSettings(){
   fetch(`/control?rate=${r.value}&brightness=${b.value}`).catch(console.error)
 }
 
+function validateInput(input,isValid){
+  input.classList.remove("valid","invalid");
+  input.classList.add(isValid?"valid":"invalid");
+  return isValid
+}
+
 function setWiFi(){
-  fetch(`/set_wifi?ssid=${encodeURIComponent(document.getElementById("ssid").value)}&pass=${encodeURIComponent(document.getElementById("pass").value)}`)
+  const ssidInput=document.getElementById("ssid");
+  const passInput=document.getElementById("pass");
+
+  const ssidValid=validateInput(ssidInput,ssidInput.value.length>0);
+  const passValid=validateInput(passInput,passInput.value.length>=8||passInput.value.length===0);
+
+  if(!ssidValid){
+    alert("SSID cannot be empty");
+    return
+  }
+  if(!passValid){
+    alert("Password must be at least 8 characters or empty for open network");
+    return
+  }
+
+  const btn=event.target;
+  const originalText=btn.textContent;
+  btn.textContent="Saving...";
+  btn.disabled=true;
+
+  fetch(`/set_wifi?ssid=${encodeURIComponent(ssidInput.value)}&pass=${encodeURIComponent(passInput.value)}`)
+    .then(()=>{
+      btn.textContent="WiFi Updated!";
+      setTimeout(()=>{btn.textContent=originalText;btn.disabled=false},3000)
+    })
+    .catch((err)=>{
+      // Connection reset is expected during restart - treat as success
+      if(err.message.includes("fetch")||err.message.includes("Failed")){
+        btn.textContent="WiFi Updated!";
+        setTimeout(()=>{btn.textContent=originalText;btn.disabled=false},3000)
+      }else{
+        btn.textContent="Error!";
+        setTimeout(()=>{btn.textContent=originalText;btn.disabled=false},2000)
+      }
+    })
+}
+
+function setMDNS(){
+  const mdnsInput=document.getElementById("mdns_name");
+  const mdnsRegex=/^[a-z0-9]([a-z0-9-]*[a-z0-9])?$/i;
+
+  const mdnsValid=validateInput(mdnsInput,mdnsInput.value.length>0&&mdnsInput.value.length<=63&&mdnsRegex.test(mdnsInput.value));
+
+  if(!mdnsValid){
+    alert("mDNS name must be 1-63 characters, alphanumeric with hyphens (not starting/ending with hyphen)");
+    return
+  }
+
+  const btn=event.target;
+  const originalText=btn.textContent;
+  btn.textContent="Saving...";
+  btn.disabled=true;
+
+  const newName=mdnsInput.value;
+
+  fetch(`/set_mdns?name=${encodeURIComponent(newName)}`)
+    .then(()=>{
+      btn.textContent="mDNS Updated!";
+      setTimeout(()=>{
+        btn.textContent="Redirecting...";
+        window.location.href=`http://${newName}.local/`
+      },1000)
+    })
+    .catch((err)=>{
+      // Connection reset is expected during restart - treat as success
+      if(err.message.includes("fetch")||err.message.includes("Failed")){
+        btn.textContent="mDNS Updated!";
+        setTimeout(()=>{
+          btn.textContent="Redirecting...";
+          window.location.href=`http://${newName}.local/`
+        },2000)
+      }else{
+        btn.textContent="Error!";
+        setTimeout(()=>{btn.textContent=originalText;btn.disabled=false},2000)
+      }
+    })
 }
 
 function updateSerial(){
@@ -228,6 +370,32 @@ function toggleAutoUpdate(){
   autoUpdate=!autoUpdate;
   document.getElementById("autoUpdateBtn").textContent=`Auto-update: ${autoUpdate?"ON":"OFF"}`;
   if(autoUpdate)startSerialUpdate();else clearInterval(updateInterval)
+}
+
+function toggleSettings(){
+  const container=document.getElementById("settingsContainer");
+  const toggle=document.getElementById("settingsToggle");
+
+  if(container.style.display==="none"){
+    container.style.display="block";
+    toggle.textContent="▼"
+  }else{
+    container.style.display="none";
+    toggle.textContent="▶"
+  }
+}
+
+function toggleSerial(){
+  const container=document.getElementById("serialContainer");
+  const toggle=document.getElementById("serialToggle");
+
+  if(container.style.display==="none"){
+    container.style.display="block";
+    toggle.textContent="▼"
+  }else{
+    container.style.display="none";
+    toggle.textContent="▶"
+  }
 }
 
 function startSerialUpdate(){
@@ -272,6 +440,8 @@ void setupServer() {
     if (renderer.rendererRunning == 0) renderer.start();
     renderer.sd_start(current_file);
 
+    currentlyPlayingFile = file;
+
     pixels.setPixelColor(0, pixels.Color(0, 255, 0));
     pixels.show();
 
@@ -280,6 +450,7 @@ void setupServer() {
 
   server.on("/stop", HTTP_GET, [](AsyncWebServerRequest *request) {
     renderer.sd_stop();
+    currentlyPlayingFile = "";
     pixels.setPixelColor(0, pixels.Color(0, 0, 255));
     pixels.show();
     request->send(200, "text/plain", "Stopped");
@@ -325,6 +496,7 @@ void setupServer() {
     preferences.end();
 
     request->send(200, "text/plain", "Wi-Fi settings saved. Restarting.");
+    delay(100); // Give time for response to be sent
     ESP.restart();
   });
 
@@ -337,6 +509,50 @@ void setupServer() {
     serialSize = 0;
     request->send(200, "text/plain", "Serial buffer cleared");
   });
+
+  server.on("/favicon.ico", HTTP_GET, [](AsyncWebServerRequest *request) {
+    request->send(404, "text/plain", "Not found");
+  });
+
+  server.on("/get_mdns", HTTP_GET, [](AsyncWebServerRequest *request) {
+    preferences.begin("app", false);
+    String mdns_name = preferences.getString("mdns_name", "ildawavex16");
+    preferences.end();
+    request->send(200, "text/plain", mdns_name);
+  });
+
+  server.on("/get_device_info", HTTP_GET, [](AsyncWebServerRequest *request) {
+    String json = "{";
+    json += "\"ip\":\"" + WiFi.localIP().toString() + "\",";
+    preferences.begin("app", false);
+    String mdns_name = preferences.getString("mdns_name", "ildawavex16");
+    preferences.end();
+    json += "\"mdns\":\"" + mdns_name + "\",";
+    json += "\"playing\":\"" + currentlyPlayingFile + "\"";
+    json += "}";
+    request->send(200, "application/json", json);
+  });
+
+  server.on("/set_mdns", HTTP_GET, [](AsyncWebServerRequest *request) {
+    if (!request->hasParam("name")) {
+      request->send(400, "text/plain", "Missing name parameter");
+      return;
+    }
+
+    String mdns_name = request->getParam("name")->value();
+
+    if (mdns_name == "") return;
+
+    preferences.begin("app", false);
+    preferences.putString("mdns_name", mdns_name);
+    preferences.end();
+
+    request->send(200, "text/plain", "mDNS name saved. Restarting.");
+    delay(100); // Give time for response to be sent
+    ESP.restart();
+  });
+
+  ElegantOTA.begin(&server);
 
   server.begin();
 }
