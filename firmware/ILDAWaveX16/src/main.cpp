@@ -15,6 +15,7 @@
 #include "wifi_credentials.h"
 #include <ESPmDNS.h>
 #include <ElegantOTA.h>
+#include "esp_ota_ops.h"
 
 using namespace std;
 
@@ -402,6 +403,23 @@ function startSerialUpdate(){
   updateSerial();
   updateInterval=setInterval(updateSerial,1000)
 }
+
+function waitForReboot(){
+  fetch("/ota_status").then(()=>{
+    location.reload()
+  }).catch(()=>{
+    setTimeout(waitForReboot,2000)
+  })
+}
+
+// Monitor for OTA updates by checking if update page is opened
+setInterval(()=>{
+  if(document.hidden)return;
+  fetch("/ota_status").catch(()=>{
+    console.log("Device may be rebooting...");
+    waitForReboot()
+  })
+},5000)
 </script>
 </body>
 </html>
@@ -552,6 +570,56 @@ void setupServer() {
     ESP.restart();
   });
 
+  server.on("/ota_status", HTTP_GET, [](AsyncWebServerRequest *request) {
+    request->send(200, "text/plain", "ready");
+  });
+
+  // Setup OTA callbacks for progress tracking
+  ElegantOTA.onStart([]() {
+    webSerialln("=== OTA UPDATE STARTED ===");
+    webSerialln("Starting OTA update...");
+
+    // Turn LED red during update
+    pixels.setPixelColor(0, pixels.Color(255, 0, 0));
+    pixels.show();
+  });
+
+  ElegantOTA.onProgress([](size_t current, size_t total) {
+    static unsigned long lastPrint = 0;
+    unsigned long now = millis();
+
+    // Print progress every 2 seconds
+    if (now - lastPrint > 2000) {
+      int progress = (current * 100) / total;
+      webSerial("OTA Progress: ");
+      webSerial(String(progress));
+      webSerialln("%");
+      lastPrint = now;
+    }
+  });
+
+  ElegantOTA.onEnd([](bool success) {
+    if (success) {
+      webSerialln("=== OTA UPDATE SUCCESSFUL ===");
+      webSerialln("Firmware updated successfully!!");
+      webSerialln("Device will reboot to apply changes...");
+
+      // Turn LED green for success
+      pixels.setPixelColor(0, pixels.Color(0, 255, 0));
+      pixels.show();
+
+      // Restart the device to apply the update
+      ESP.restart();
+    } else {
+      webSerialln("=== OTA UPDATE FAILED ===");
+      webSerialln("OTA update failed! Device will continue with current firmware.");
+
+      // Turn LED blue (normal operation)
+      pixels.setPixelColor(0, pixels.Color(0, 0, 255));
+      pixels.show();
+    }
+  });
+
   ElegantOTA.begin(&server);
 
   server.begin();
@@ -575,6 +643,18 @@ void setup() {
 
   pixels.setPixelColor(0, pixels.Color(0, 0, 255));
   pixels.show();
+
+  // Print firmware version and partition info at startup
+  webSerialln("=== ILDAWaveX16 Firmware Boot ===");
+  webSerial("Firmware Version: ");
+
+  webSerialln(__DATE__ " " __TIME__);
+
+  const esp_partition_t* running = esp_ota_get_running_partition();
+  webSerial("Running from partition: ");
+  webSerialln(running->label);
+  webSerial("Partition address: 0x");
+  webSerialln(String(running->address, HEX));
 
   init_wifi();
   esp_wifi_set_ps(WIFI_PS_NONE);
