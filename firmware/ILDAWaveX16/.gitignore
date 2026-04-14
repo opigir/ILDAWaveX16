@@ -3,3 +3,7 @@
 .vscode/c_cpp_properties.json
 .vscode/launch.json
 .vscode/ipch
+
+# WiFi credentials - DO NOT COMMIT
+src/wifi_credentials.h
+# Note: wifi_credentials.h.example is the template and should be committed
