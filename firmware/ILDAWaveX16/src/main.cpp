@@ -209,7 +209,7 @@ const char index_html[] PROGMEM = R"rawliteral(
 </div>
 </div>
 </main>
-<footer><a href="https://stanleyprojects.com/" style="color:inherit;text-decoration:none" target="_blank" rel="noopener noreferrer">StanleyProjects</a> | VER 0.1</footer>
+<footer><a href="https://stanleyprojects.com/" style="color:inherit;text-decoration:none" target="_blank" rel="noopener noreferrer">StanleyProjects</a> | VER 0.2</footer>
 <script>
 let s=null,autoUpdate=true,updateInterval;
 
