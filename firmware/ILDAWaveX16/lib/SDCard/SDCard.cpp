@@ -1,4 +1,6 @@
 #include "SDCard.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 SPIClass SDSPI(FSPI);
 
@@ -78,8 +80,14 @@ void SDCard::listFiles(vector<String>& list, const char* path) {
   if (!root) return;
   File file = root.openNextFile();
   while (file) {
-    if (file.isDirectory()) listFiles(list, file.path());
-    else if (strstr(file.path(), ".ild") || strstr(file.path(), ".ILD")) list.push_back(file.path());    
+    if (file.isDirectory()) {
+      listFiles(list, file.path());
+    } else if (strstr(file.path(), ".ild") || strstr(file.path(), ".ILD")) {
+      // Skip any hidden files that start with dot
+      if (file.name()[0] != '.') {
+        list.push_back(file.path());
+      }
+    }
     file.close();
     file = root.openNextFile();
   }
@@ -90,30 +98,55 @@ String listFilesRecursive(const char *dirname, int depth) {
   File dir = SD.open(dirname);
   if (!dir || !dir.isDirectory()) return "";
 
+  int fileCount = 0;
   while (true) {
     File file = dir.openNextFile();
     if (!file) break;
 
     String fullPath = String(dirname);
-    if (!fullPath.endsWith("/")) fullPath += "/";
+    if (!fullPath.endsWith("/") && strlen(dirname) > 1) fullPath += "/";
     fullPath += file.name();
-    
+
     if (file.isDirectory()) {
       rows += listFilesRecursive(fullPath.c_str(), depth + 1);
     } else if (strstr(file.path(), ".ild") || strstr(file.path(), ".ILD")) {
+      // Skip any hidden files that start with dot
+      if (file.name()[0] == '.') {
+        file.close();
+        continue;
+      }
       rows += "<tr data-filename='" + fullPath + "'>";
       rows += "<td>" + fullPath + "</td>";
       rows += "<td>" + String(file.size()) + " bytes</td>";
       rows += "</tr>";
     }
     file.close();
+
+    // Yield control every 3 files to prevent watchdog timeout
+    fileCount++;
+    if (fileCount % 3 == 0) {
+      vTaskDelay(pdMS_TO_TICKS(50));
+    }
   }
   dir.close();
   return rows;
 }
 
+void SDCard::refreshFileCache() {
+  cachedFileRows = listFilesRecursive("/", 0);
+  lastCacheUpdate = millis();
+}
+
 String SDCard::generateFileRows() {
-  return listFilesRecursive("/", 0);
+  unsigned long currentTime = millis();
+
+  // Check if cache is empty or expired
+  if (cachedFileRows.isEmpty() ||
+      (currentTime - lastCacheUpdate) > CACHE_DURATION_MS) {
+    refreshFileCache();
+  }
+
+  return cachedFileRows;
 }
 
 void SDCard::read(const char* path) {
