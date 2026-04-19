@@ -660,6 +660,7 @@ void setup() {
   esp_wifi_set_ps(WIFI_PS_NONE);
   sd.begin();
   sd.mount();
+  sd.refreshFileCache();
   idn.begin();
   idn.setRendererHandle(&renderer);
   iwp.begin();

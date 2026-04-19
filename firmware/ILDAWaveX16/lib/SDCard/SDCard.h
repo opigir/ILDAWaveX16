@@ -21,9 +21,13 @@ class SDCard {
     void list();
     void listFiles(vector<String>& list, const char* path = "/");
     String generateFileRows();
+    void refreshFileCache();
     void read(const char* path);
     File getFile(const char* path);
   private:
+    String cachedFileRows = "";
+    unsigned long lastCacheUpdate = 0;
+    static const unsigned long CACHE_DURATION_MS = 30000; // 30 seconds
 };
 
 #endif /* SDCARD_H */
