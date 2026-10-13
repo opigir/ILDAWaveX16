@@ -66,6 +66,10 @@ void Renderer::SDTask(void* pvParameters) {
     if (pointsRead <= 0) { vTaskDelay(pdMS_TO_TICKS(1)); continue; }
     while (!pointBuffer.canItFit(pointsRead)) { vTaskDelay(pdMS_TO_TICKS(1)); }
     self->buffer_add_points(p, pointsRead);
+    // Always yield a tick per chunk (still ~512k pts/s headroom). When the SD bus is contended
+    // (e.g. a directory scan) the buffer may never fill, and without this IDLE0 starves and
+    // trips the task watchdog.
+    vTaskDelay(1);
   }
 }
 

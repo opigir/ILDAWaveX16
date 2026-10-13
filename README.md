@@ -1,3 +1,15 @@
+> [!WARNING]
+> **This board has been superseded by ILDAWaveX16 V2.**
+>
+> The original **ILDAWaveX16** hardware files are fully released and remain available for anyone to study, modify, manufacture, and use.
+>
+> This repository is no longer actively maintained, and the original Arduino-based firmware is kept mainly for reference and legacy use.
+>
+> Active firmware development has moved to the newer **ILDAWaveX16 V2** project. The V2 firmware is also compatible with the original ILDAWaveX16 V1 hardware by changing the board version setting.
+>
+> For the current version, firmware, and documentation, see:  
+> https://stanleyprojects.com/projects/ildawavex16v2
+
 # ILDAWaveX16 - Open Source Laser DAC
 [![](https://stanleyprojects.com/projects/ildawavex16/thumbs/cover-text.jpg)](https://stanleyprojects.com/projects/ildawavex16)
 
