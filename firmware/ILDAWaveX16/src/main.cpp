@@ -98,12 +98,17 @@ class PlaybackLock {
     ~PlaybackLock() { xSemaphoreGiveRecursive(playbackMutex); }
 };
 
+// The SD scan can take several seconds, so it runs without holding playbackMutex;
+// otherwise web handlers waiting on the lock starve async_tcp and trip the task watchdog.
+// Callers must not hold the lock either.
 void refreshPlaylist() {
-  PlaybackLock lock;
   if (!sd.isAvailable()) sd.checkAndMount();
-  playlist.clear();
-  sd.listFiles(playlist);
-  sort(playlist.begin(), playlist.end());
+  vector<String> files;
+  sd.listFiles(files);
+  sort(files.begin(), files.end());
+
+  PlaybackLock lock;
+  playlist.swap(files);
   playlistLoaded = true;
 
   currentIndex = -1;
@@ -112,8 +117,8 @@ void refreshPlaylist() {
   }
 }
 
+// Call before taking playbackMutex (see refreshPlaylist)
 void ensurePlaylist() {
-  PlaybackLock lock;
   if (!playlistLoaded) refreshPlaylist();
 }
 
@@ -131,16 +136,28 @@ bool startPlayback(const String& path, String& err) {
     return false;
   }
 
+  // Validate before stopping, so a bad request doesn't interrupt current playback
+  if (!sd.fileExists(path.c_str())) {
+    err = "File not found: " + path;
+    return false;
+  }
+
   haltSdStream();
 
   current_file = sd.getFile(path.c_str());
   if (!current_file) {
     err = "Failed to open file - SD card may have been disconnected";
+    currentlyPlayingFile = "";
     return false;
   }
 
   if (renderer.rendererRunning == 0) renderer.start();
   renderer.sd_start(current_file);
+  if (!renderer.sdRunning) {
+    err = "Not a valid ILDA file: " + path;
+    currentlyPlayingFile = "";
+    return false;
+  }
 
   currentlyPlayingFile = path;
   currentIndex = -1;
@@ -154,8 +171,8 @@ bool startPlayback(const String& path, String& err) {
 }
 
 bool startPlaybackIndex(int index, String& err) {
-  PlaybackLock lock;
   ensurePlaylist();
+  PlaybackLock lock;
   if (playlist.empty()) { err = "No ILDA files on SD card"; return false; }
   if (index < 0 || index >= (int)playlist.size()) {
     err = "Index out of range (0-" + String(playlist.size() - 1) + ")";
@@ -204,8 +221,8 @@ void handleOsc(OSCServer& server, const OSCMessage& msg) {
   }
   else if (addr == "/ilda/next" || addr == "/ilda/prev") {
     if (!msg.isTrigger()) return;
-    PlaybackLock lock;
     ensurePlaylist();
+    PlaybackLock lock;
     if (playlist.empty()) {
       log += " - no ILDA files on SD card";
     } else {
@@ -233,8 +250,9 @@ void handleOsc(OSCServer& server, const OSCMessage& msg) {
     log += " " + String(rate);
   }
   else if (addr == "/ilda/refresh") {
+    unsigned long t0 = millis();
     refreshPlaylist();
-    log += " - " + String(playlist.size()) + " files";
+    log += " - " + String(playlist.size()) + " files in " + String(millis() - t0) + " ms";
   }
   else if (addr == "/ilda/status") {
     PlaybackLock lock;
@@ -247,8 +265,8 @@ void handleOsc(OSCServer& server, const OSCMessage& msg) {
     return;
   }
   else if (addr == "/ilda/files") {
-    PlaybackLock lock;
     ensurePlaylist();
+    PlaybackLock lock;
     server.beginReply("/ilda/count");
     server.addInt(playlist.size());
     server.sendReply();
@@ -928,6 +946,7 @@ void setup() {
   sd.begin();
   sd.mount();
   sd.refreshFileCache();
+  refreshPlaylist();
   idn.begin();
   idn.setRendererHandle(&renderer);
   iwp.begin();

@@ -5,6 +5,12 @@
 
 SPIClass SDSPI(FSPI);
 
+// Skip hidden and OS metadata folders (e.g. macOS .Spotlight-V100, .fseventsd, .Trashes) -
+// they never hold show files, and walking .Spotlight-V100 alone can take 7+ seconds
+static bool isSkippedDir(const char* name) {
+  return name[0] == '.' || strcmp(name, "System Volume Information") == 0;
+}
+
 void SDCard::begin() {
   SDSPI.begin(PIN_SD_SCK, PIN_SD_MISO, PIN_SD_MOSI, PIN_SD_CS);
 }
@@ -95,7 +101,7 @@ void SDCard::listFiles(vector<String>& list, const char* path) {
   File file = root.openNextFile();
   while (file) {
     if (file.isDirectory()) {
-      listFiles(list, file.path());
+      if (!isSkippedDir(file.name())) listFiles(list, file.path());
     } else if (strstr(file.path(), ".ild") || strstr(file.path(), ".ILD")) {
       // Skip any hidden files that start with dot
       if (file.name()[0] != '.') {
@@ -147,7 +153,7 @@ String listFilesRecursive(const char *dirname, int depth) {
     fullPath += file.name();
 
     if (file.isDirectory()) {
-      rows += listFilesRecursive(fullPath.c_str(), depth + 1);
+      if (!isSkippedDir(file.name())) rows += listFilesRecursive(fullPath.c_str(), depth + 1);
     } else if (strstr(file.path(), ".ild") || strstr(file.path(), ".ILD")) {
       // Skip any hidden files that start with dot
       if (file.name()[0] == '.') {
@@ -240,6 +246,14 @@ File SDCard::getFile(const char* path) {
     return File();  // Return empty file handle
   }
   return SD.open(path);
+}
+
+bool SDCard::fileExists(const char* path) {
+  if (!isAvailable() || !SD.exists(path)) return false;
+  File f = SD.open(path);
+  bool isFile = f && !f.isDirectory();
+  if (f) f.close();
+  return isFile;
 }
 
 bool SDCard::checkAndMount() {

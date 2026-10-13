@@ -24,6 +24,7 @@ class SDCard {
     void refreshFileCache();
     void read(const char* path);
     File getFile(const char* path);
+    bool fileExists(const char* path);
     bool isAvailable();
     bool checkAndMount();
   private:
