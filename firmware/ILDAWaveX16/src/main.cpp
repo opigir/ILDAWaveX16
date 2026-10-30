@@ -1,10 +1,12 @@
 #include <Arduino.h> 
 #include <vector>
+#include <algorithm>
 #include <Adafruit_NeoPixel.h>
 #include <SDCard.h>
 #include <Renderer.h>
 #include <IDNServer.h>
 #include <IWPServer.h>
+#include <OSCServer.h>
 #include <WiFi.h>
 #include "esp_wifi.h"
 #include <AsyncTCP.h>
@@ -34,8 +36,44 @@ File current_file;
 
 IDNServer idn;
 IWPServer iwp;
+OSCServer osc;
 
 String currentlyPlayingFile = "";
+
+// Guards playback state + playlist; playback can be triggered from both the
+// web server (async_tcp task) and OSC (udp_loop task). Recursive so helpers can nest.
+SemaphoreHandle_t playbackMutex = nullptr;
+vector<String> playlist; // Sorted .ild paths for OSC index / next / prev
+bool playlistLoaded = false;
+int currentIndex = -1;
+uint16_t oscPort = OSC_DEFAULT_PORT;
+
+// ---------------- Wi-Fi ----------------
+// The setup access point is only up while the laser can't reach the configured network:
+// at boot if joining fails, or after the network has been gone for SETUP_AP_FALLBACK_MS.
+// Once the station connection is up, the AP is switched off again, so nobody nearby can
+// join it and drive the laser from the web page during a show.
+// Override any of these with build flags, e.g. -D SETUP_AP_PASSWORD=\"something-else\"
+#ifndef SETUP_AP_SSID
+#define SETUP_AP_SSID "ILDAWaveX16"
+#endif
+#ifndef SETUP_AP_PASSWORD
+#define SETUP_AP_PASSWORD "ildawave"
+#endif
+#ifndef SETUP_AP_ALWAYS_ON
+#define SETUP_AP_ALWAYS_ON 0      // 1 = old behaviour: setup AP on all the time
+#endif
+#ifndef SETUP_AP_FALLBACK_MS
+#define SETUP_AP_FALLBACK_MS 60000 // Network gone this long -> setup AP comes back
+#endif
+#ifndef WIFI_RETRY_MS
+#define WIFI_RETRY_MS 10000        // How often to retry joining while disconnected
+#endif
+
+String staSsid;
+String staPassword;
+String mdnsName;
+bool mdnsStarted = false;
 
 // Function to add text to serial buffer for web display
 void addToSerialBuffer(String text) {
@@ -81,30 +119,289 @@ void webSerialln(String text) {
   addToSerialBuffer(text + "\n");
 }
 
-void init_wifi() {
-  String ssid;
-  String password;
-  String mdns_name;
+class PlaybackLock {
+  public:
+    PlaybackLock() { xSemaphoreTakeRecursive(playbackMutex, portMAX_DELAY); }
+    ~PlaybackLock() { xSemaphoreGiveRecursive(playbackMutex); }
+};
 
-  preferences.begin("app", false);
-  ssid = preferences.getString("ssid", "");
-  password = preferences.getString("password", "");
-  mdns_name = preferences.getString("mdns_name", "ildawavex16");
-  preferences.end();
+// The SD scan can take several seconds, so it runs without holding playbackMutex;
+// otherwise web handlers waiting on the lock starve async_tcp and trip the task watchdog.
+// Callers must not hold the lock either.
+void refreshPlaylist() {
+  if (!sd.isAvailable()) sd.checkAndMount();
+  vector<String> files;
+  sd.listFiles(files);
+  sort(files.begin(), files.end());
 
-  if (ssid == "" || password == ""){
-    ssid = WIFI_SSID;
-    password = WIFI_PASSWORD;
+  PlaybackLock lock;
+  playlist.swap(files);
+  playlistLoaded = true;
+
+  currentIndex = -1;
+  for (int i = 0; i < (int)playlist.size(); i++) {
+    if (playlist[i] == currentlyPlayingFile) { currentIndex = i; break; }
+  }
+}
+
+// Call before taking playbackMutex (see refreshPlaylist)
+void ensurePlaylist() {
+  if (!playlistLoaded) refreshPlaylist();
+}
+
+// Stop SD streaming and give SDTask (10ms idle poll) time to notice before the file is reused
+static void haltSdStream() {
+  renderer.sd_stop();
+  vTaskDelay(pdMS_TO_TICKS(15));
+}
+
+bool startPlayback(const String& path, String& err) {
+  PlaybackLock lock;
+
+  if (!sd.isAvailable()) {
+    err = "SD card not available - cannot play file";
+    return false;
   }
 
-  WiFi.mode(WIFI_AP_STA);
+  // Validate before stopping, so a bad request doesn't interrupt current playback
+  if (!sd.fileExists(path.c_str())) {
+    err = "File not found: " + path;
+    return false;
+  }
 
-  WiFi.softAP("ILDAWaveX16", "ildawave");
-  webSerial("AP IP address: ");
+  haltSdStream();
+
+  current_file = sd.getFile(path.c_str());
+  if (!current_file) {
+    err = "Failed to open file - SD card may have been disconnected";
+    currentlyPlayingFile = "";
+    return false;
+  }
+
+  if (renderer.rendererRunning == 0) renderer.start();
+  renderer.sd_start(current_file);
+  if (!renderer.sdRunning) {
+    err = "Not a valid ILDA file: " + path;
+    currentlyPlayingFile = "";
+    return false;
+  }
+
+  currentlyPlayingFile = path;
+  currentIndex = -1;
+  for (int i = 0; i < (int)playlist.size(); i++) {
+    if (playlist[i] == path) { currentIndex = i; break; }
+  }
+
+  pixels.setPixelColor(0, pixels.Color(0, 255, 0));
+  pixels.show();
+  return true;
+}
+
+bool startPlaybackIndex(int index, String& err) {
+  ensurePlaylist();
+  PlaybackLock lock;
+  if (playlist.empty()) { err = "No ILDA files on SD card"; return false; }
+  if (index < 0 || index >= (int)playlist.size()) {
+    err = "Index out of range (0-" + String(playlist.size() - 1) + ")";
+    return false;
+  }
+  return startPlayback(playlist[index], err);
+}
+
+void stopPlayback() {
+  PlaybackLock lock;
+  haltSdStream();
+  currentlyPlayingFile = "";
+  pixels.setPixelColor(0, pixels.Color(0, 0, 255));
+  pixels.show();
+}
+
+String getCurrentlyPlaying() {
+  PlaybackLock lock;
+  return currentlyPlayingFile;
+}
+
+void handleOsc(OSCServer& server, const OSCMessage& msg) {
+  String addr = msg.address;
+  String err;
+  String log = "OSC: " + addr;
+
+  if (addr == "/ilda/play" || addr == "/ilda/play/index") {
+    const char* name;
+    int32_t index;
+    if (addr == "/ilda/play" && msg.argAsString(0, name)) {
+      String path = name;
+      if (!path.startsWith("/")) path = "/" + path;
+      log += " " + path;
+      if (!startPlayback(path, err)) log += " - " + err;
+    } else if (msg.argAsInt(0, index)) {
+      // Index 0 is a valid file, so no button-release filtering here
+      log += " " + String(index);
+      if (!startPlaybackIndex(index, err)) log += " - " + err;
+    } else {
+      log += " - missing file name or index";
+    }
+  }
+  else if (addr == "/ilda/stop") {
+    if (!msg.isTrigger()) return;
+    stopPlayback();
+  }
+  else if (addr == "/ilda/next" || addr == "/ilda/prev") {
+    if (!msg.isTrigger()) return;
+    ensurePlaylist();
+    PlaybackLock lock;
+    if (playlist.empty()) {
+      log += " - no ILDA files on SD card";
+    } else {
+      int n = playlist.size();
+      int step = (addr == "/ilda/next") ? 1 : -1;
+      // From a stopped / unknown position, next starts at the first file and prev at the last
+      int next = (currentIndex < 0) ? (step > 0 ? 0 : n - 1) : ((currentIndex + step + n) % n);
+      log += " " + playlist[next];
+      if (!startPlayback(playlist[next], err)) log += " - " + err;
+    }
+  }
+  else if (addr == "/ilda/brightness") {
+    float v;
+    if (!msg.argAsFloat(0, v)) return;
+    // Floats 0.0-1.0 (typical fader range) are scaled to percent; anything else is taken as percent
+    int percent = (msg.args[0].type == OSC_FLOAT && v <= 1.0f) ? lroundf(v * 100.0f) : lroundf(v);
+    percent = constrain(percent, 0, 100);
+    renderer.change_brightness(percent);
+    log += " " + String(percent);
+  }
+  else if (addr == "/ilda/rate") {
+    int32_t rate;
+    if (!msg.argAsInt(0, rate) || rate <= 0) return;
+    renderer.change_freq(rate);
+    log += " " + String(rate);
+  }
+  else if (addr == "/ilda/refresh") {
+    unsigned long t0 = millis();
+    refreshPlaylist();
+    log += " - " + String(playlist.size()) + " files in " + String(millis() - t0) + " ms";
+  }
+  else if (addr == "/ilda/status") {
+    PlaybackLock lock;
+    server.beginReply("/ilda/status");
+    server.addString(currentlyPlayingFile.c_str());
+    server.addInt(currentIndex);
+    server.addInt(renderer.brightness);
+    server.addInt(renderer.timer_val);
+    server.sendReply();
+    return;
+  }
+  else if (addr == "/ilda/files") {
+    ensurePlaylist();
+    PlaybackLock lock;
+    server.beginReply("/ilda/count");
+    server.addInt(playlist.size());
+    server.sendReply();
+    for (int i = 0; i < (int)playlist.size(); i++) {
+      server.beginReply("/ilda/file");
+      server.addInt(i);
+      server.addString(playlist[i].c_str());
+      server.sendReply();
+    }
+    return;
+  }
+  else return; // Unknown address - ignore silently
+
+  webSerialln(log);
+}
+
+bool setupApOn() {
+  wifi_mode_t mode = WiFi.getMode();
+  return mode == WIFI_AP || mode == WIFI_AP_STA;
+}
+
+void startSetupAp() {
+  if (setupApOn()) return;
+  WiFi.softAP(SETUP_AP_SSID, SETUP_AP_PASSWORD);
+  webSerial("Setup AP on: " SETUP_AP_SSID " at ");
   webSerialln(WiFi.softAPIP().toString());
+}
 
-  WiFi.begin(ssid, password);
-  webSerial("Connecting to WiFi");
+void stopSetupAp() {
+  if (SETUP_AP_ALWAYS_ON || !setupApOn()) return;
+  WiFi.softAPdisconnect(true);
+  webSerialln("Setup AP off (joined " + staSsid + ")");
+}
+
+// Runs every time the station connection comes up, not just at boot,
+// so mDNS works even if the network appeared after the laser was powered on.
+void onWifiConnected() {
+  webSerial("Local IP: ");
+  webSerialln(WiFi.localIP().toString());
+
+  if (!mdnsStarted) {
+    if (MDNS.begin(mdnsName.c_str())) {
+      mdnsStarted = true;
+      webSerial("mDNS responder started: ");
+      webSerial(mdnsName);
+      webSerialln(".local");
+      MDNS.addService("http", "tcp", 80);
+      MDNS.addService("osc", "udp", oscPort);
+    } else {
+      webSerialln("Error starting mDNS");
+    }
+  }
+  stopSetupAp();
+}
+
+// Keeps retrying the configured network for as long as the laser is on, and manages the setup AP.
+void wifi_loop(void* pvParameters) {
+  bool wasConnected = WiFi.status() == WL_CONNECTED;
+  unsigned long lastConnected = millis();
+  unsigned long lastRetry = millis();
+
+  while (1) {
+    unsigned long now = millis();
+    bool connected = WiFi.status() == WL_CONNECTED;
+
+    if (connected) {
+      lastConnected = now;
+      if (!wasConnected) onWifiConnected();
+    } else {
+      if (wasConnected) webSerialln("Wi-Fi lost, retrying every " + String(WIFI_RETRY_MS / 1000) + " s");
+
+      // Retrying makes the radio scan, which knocks setup-AP clients off.
+      // Don't retry while someone is on the setup page.
+      if (now - lastRetry >= WIFI_RETRY_MS && WiFi.softAPgetStationNum() == 0) {
+        lastRetry = now;
+        WiFi.disconnect();
+        WiFi.begin(staSsid.c_str(), staPassword.c_str());
+      }
+      if (now - lastConnected >= SETUP_AP_FALLBACK_MS) startSetupAp();
+    }
+    wasConnected = connected;
+    vTaskDelay(pdMS_TO_TICKS(500));
+  }
+}
+
+void init_wifi() {
+  preferences.begin("app", false);
+  staSsid = preferences.getString("ssid", "");
+  staPassword = preferences.getString("password", "");
+  mdnsName = preferences.getString("mdns_name", "ildawavex16");
+  oscPort = preferences.getUShort("osc_port", OSC_DEFAULT_PORT);
+  preferences.end();
+
+  if (staSsid == "" || staPassword == ""){
+    staSsid = WIFI_SSID;
+    staPassword = WIFI_PASSWORD;
+  }
+
+  WiFi.persistent(false);
+  WiFi.mode(SETUP_AP_ALWAYS_ON ? WIFI_AP_STA : WIFI_STA);
+  if (SETUP_AP_ALWAYS_ON) {
+    WiFi.softAP(SETUP_AP_SSID, SETUP_AP_PASSWORD);
+    webSerial("AP IP address: ");
+    webSerialln(WiFi.softAPIP().toString());
+  }
+
+  WiFi.begin(staSsid.c_str(), staPassword.c_str());
+  webSerial("Connecting to " + staSsid);
 
   uint8_t attempts = 0;
   while (WiFi.status() != WL_CONNECTED && attempts < 20) {
@@ -112,21 +409,16 @@ void init_wifi() {
       webSerial(".");
       attempts++;
   }
-  if (WiFi.status() == WL_CONNECTED) {
-    webSerial("\nLocal IP: ");
-    webSerialln(WiFi.localIP().toString());
+  webSerialln("");
 
-    // Start mDNS service
-    if (MDNS.begin(mdns_name.c_str())) {
-      webSerial("mDNS responder started: ");
-      webSerial(mdns_name);
-      webSerialln(".local");
-      MDNS.addService("http", "tcp", 80);
-    } else {
-      webSerialln("Error starting mDNS");
-    }
+  if (WiFi.status() == WL_CONNECTED) {
+    onWifiConnected();
+  } else {
+    webSerialln("WiFi Connection Failed! Retrying in the background.");
+    startSetupAp();
   }
-  else webSerialln("\nWiFi Connection Failed!");
+
+  xTaskCreatePinnedToCore(wifi_loop, "wifi_loop", 4096, NULL, 1, NULL, 0);
 }
 
 const char index_html[] PROGMEM = R"rawliteral(
@@ -144,7 +436,7 @@ const char index_html[] PROGMEM = R"rawliteral(
 <main>
 <h2>&#9889; ILDAWaveX16 &#9889;</h2>
 <div id="deviceInfo" style="text-align:center;margin-bottom:1em;padding:0.5em;font-size:0.85em;color:var(--text-dim);">
-<div>IP: <span id="deviceIP">Loading...</span> | mDNS: <span id="deviceMDNS">Loading...</span>.local</div>
+<div>IP: <span id="deviceIP">Loading...</span> | mDNS: <span id="deviceMDNS">Loading...</span>.local | OSC: <span id="deviceOSC">Loading...</span></div>
 </div>
 <div id="nowPlaying" style="display:none;text-align:center;margin-bottom:1em;padding:0.75em;background:linear-gradient(90deg,var(--accent),var(--primary));border-radius:var(--radius);font-weight:600;">
 <div>&#9654; Now Playing: <span id="currentFile"></span></div>
@@ -192,6 +484,19 @@ const char index_html[] PROGMEM = R"rawliteral(
 </div>
 </div>
 <div style="padding:1em;">
+<div style="font-weight:600;margin-bottom:0.75em;padding-bottom:0.5em;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:0.5em;">&#127899; OSC</div>
+<div class="input-group">
+<input type="text" id="osc_port" placeholder="UDP port (default 8000)" inputmode="numeric">
+<button onclick="setOSCPort()">Save & Restart</button>
+</div>
+<div style="margin-top:0.75em;font-size:0.8em;color:var(--text-dim);font-family:monospace;line-height:1.5em;">
+/ilda/play "/file.ild" &middot; /ilda/play 0 &middot; /ilda/play/index 0<br>
+/ilda/stop &middot; /ilda/next &middot; /ilda/prev &middot; /ilda/refresh<br>
+/ilda/brightness 0-100 | 0.0-1.0 &middot; /ilda/rate &micro;s<br>
+/ilda/status &middot; /ilda/files (replies to sender)
+</div>
+</div>
+<div style="padding:1em;">
 <div style="cursor:pointer;font-weight:600;margin-bottom:0.75em;padding-bottom:0.5em;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:0.5em;" onclick="toggleSerial()">&#128196; Serial Monitor <span id="serialToggle">&#9660;</span></div>
 <div id="serialContainer">
 <div id="serialOutput" style="height:12em;overflow-y:auto;background:var(--primary);border-radius:var(--radius);padding:0.75em;font-family:monospace;font-size:0.85em;line-height:1.2em;white-space:pre-wrap;border:1px solid var(--border);"></div>
@@ -225,9 +530,12 @@ document.addEventListener("DOMContentLoaded",()=>{
   });
   startSerialUpdate();
   loadMDNSName();
+  loadOSCPort();
   loadDeviceInfo();
-  setInterval(loadDeviceInfo, 5000)
+  setInterval(loadDeviceInfo, 5000);
 });
+
+// Remove SSE setup function
 
 function loadMDNSName(){
   fetch("/get_mdns").then(r=>r.text()).then(name=>{
@@ -235,10 +543,17 @@ function loadMDNSName(){
   }).catch(console.error)
 }
 
+function loadOSCPort(){
+  fetch("/get_osc_port").then(r=>r.text()).then(port=>{
+    document.getElementById("osc_port").value=port
+  }).catch(console.error)
+}
+
 function loadDeviceInfo(){
   fetch("/get_device_info").then(r=>r.json()).then(data=>{
     document.getElementById("deviceIP").textContent=data.ip;
     document.getElementById("deviceMDNS").textContent=data.mdns;
+    document.getElementById("deviceOSC").textContent=data.osc_port;
 
     const nowPlaying=document.getElementById("nowPlaying");
     const currentFile=document.getElementById("currentFile");
@@ -251,6 +566,7 @@ function loadDeviceInfo(){
     }
   }).catch(console.error)
 }
+
 
 function playFile(){
   if(!s){alert("Select a file.");return}
@@ -353,6 +669,33 @@ function setMDNS(){
     })
 }
 
+function setOSCPort(){
+  const portInput=document.getElementById("osc_port");
+  const port=parseInt(portInput.value,10);
+  const portValid=validateInput(portInput,/^\d+$/.test(portInput.value)&&port>=1024&&port<=65535&&port!==7200&&port!==7255);
+
+  if(!portValid){
+    alert("OSC port must be 1024-65535 and not 7200 (IWP) or 7255 (IDN)");
+    return
+  }
+
+  const btn=event.target;
+  const originalText=btn.textContent;
+  btn.textContent="Saving...";
+  btn.disabled=true;
+
+  fetch(`/set_osc_port?port=${port}`)
+    .then(r=>{
+      btn.textContent=r.ok?"OSC Port Updated!":"Error!";
+      setTimeout(()=>{btn.textContent=originalText;btn.disabled=false},3000)
+    })
+    .catch(()=>{
+      // Connection reset is expected during restart - treat as success
+      btn.textContent="OSC Port Updated!";
+      setTimeout(()=>{btn.textContent=originalText;btn.disabled=false},3000)
+    })
+}
+
 function updateSerial(){
   fetch("/serial").then(r=>r.text()).then(data=>{
     const out=document.getElementById("serialOutput");
@@ -427,6 +770,11 @@ setInterval(()=>{
 
 void setupServer() {
   server.on("/", HTTP_GET, [](AsyncWebServerRequest* request) {
+    // Try to mount SD card if not currently available
+    if (!sd.isAvailable()) {
+      sd.checkAndMount();
+    }
+
     String page = index_html;
     page.replace(F("<!-- FILE_ROWS -->"), sd.generateFileRows());
     request->send(200, "text/html", page);
@@ -449,28 +797,17 @@ void setupServer() {
     }
 
     String file = request->getParam("file")->value();
-    int rate = request->getParam("rate")->value().toInt();
+    String err;
+    if (!startPlayback(file, err)) {
+      request->send(500, "text/plain", err);
+      return;
+    }
 
-    renderer.sd_stop();
-
-    current_file = sd.getFile(file.c_str());
-
-    if (renderer.rendererRunning == 0) renderer.start();
-    renderer.sd_start(current_file);
-
-    currentlyPlayingFile = file;
-
-    pixels.setPixelColor(0, pixels.Color(0, 255, 0));
-    pixels.show();
-
-    request->send(200, "text/plain", "Playing " + file + " at " + String(rate) + " ms");
+    request->send(200, "text/plain", "Playing " + file + " at " + String(renderer.timer_val) + " us");
   });
 
   server.on("/stop", HTTP_GET, [](AsyncWebServerRequest *request) {
-    renderer.sd_stop();
-    currentlyPlayingFile = "";
-    pixels.setPixelColor(0, pixels.Color(0, 0, 255));
-    pixels.show();
+    stopPlayback();
     request->send(200, "text/plain", "Stopped");
   });
 
@@ -528,6 +865,14 @@ void setupServer() {
     request->send(200, "text/plain", "Serial buffer cleared");
   });
 
+  server.on("/refresh_sd", HTTP_GET, [](AsyncWebServerRequest *request) {
+    // Safely attempt to remount SD card
+    sd.checkAndMount();
+    refreshPlaylist();
+    request->send(200, "text/plain", "SD card refresh attempted");
+  });
+
+
   server.on("/favicon.ico", HTTP_GET, [](AsyncWebServerRequest *request) {
     request->send(404, "text/plain", "Not found");
   });
@@ -546,7 +891,8 @@ void setupServer() {
     String mdns_name = preferences.getString("mdns_name", "ildawavex16");
     preferences.end();
     json += "\"mdns\":\"" + mdns_name + "\",";
-    json += "\"playing\":\"" + currentlyPlayingFile + "\"";
+    json += "\"osc_port\":" + String(oscPort) + ",";
+    json += "\"playing\":\"" + getCurrentlyPlaying() + "\"";
     json += "}";
     request->send(200, "application/json", json);
   });
@@ -566,6 +912,31 @@ void setupServer() {
     preferences.end();
 
     request->send(200, "text/plain", "mDNS name saved. Restarting.");
+    delay(100); // Give time for response to be sent
+    ESP.restart();
+  });
+
+  server.on("/get_osc_port", HTTP_GET, [](AsyncWebServerRequest *request) {
+    request->send(200, "text/plain", String(oscPort));
+  });
+
+  server.on("/set_osc_port", HTTP_GET, [](AsyncWebServerRequest *request) {
+    if (!request->hasParam("port")) {
+      request->send(400, "text/plain", "Missing port parameter");
+      return;
+    }
+
+    long port = request->getParam("port")->value().toInt();
+    if (port < 1024 || port > 65535 || port == IW_UDP_PORT || port == IDNVAL_HELLO_UDP_PORT) {
+      request->send(400, "text/plain", "Port must be 1024-65535 and not 7200 (IWP) or 7255 (IDN)");
+      return;
+    }
+
+    preferences.begin("app", false);
+    preferences.putUShort("osc_port", (uint16_t)port);
+    preferences.end();
+
+    request->send(200, "text/plain", "OSC port saved. Restarting.");
     delay(100); // Give time for response to be sent
     ESP.restart();
   });
@@ -629,12 +1000,14 @@ void udp_loop(void* pvParameters) {
   while(1) {
     idn.loop();
     iwp.loop();
+    osc.loop();
     vTaskDelay(pdMS_TO_TICKS(1));
   }
 }
 
 void setup() {
   Serial.begin(115200);
+  playbackMutex = xSemaphoreCreateRecursiveMutex();
   // while(!Serial.availableForWrite()){}
 
   pixels.begin();
@@ -661,10 +1034,14 @@ void setup() {
   sd.begin();
   sd.mount();
   sd.refreshFileCache();
+  refreshPlaylist();
   idn.begin();
   idn.setRendererHandle(&renderer);
   iwp.begin();
   iwp.setRendererHandle(&renderer);
+  osc.setHandler(handleOsc);
+  osc.begin(oscPort);
+  webSerialln("OSC listening on UDP port " + String(oscPort));
 
   renderer.begin();
   renderer.start();
