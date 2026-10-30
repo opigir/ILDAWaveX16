@@ -87,7 +87,11 @@ void Renderer::DACTask(void* pvParameters) {
         p.g = (p.g * self->brightness) / 100;
         p.b = (p.b * self->brightness) / 100;
       }
-      if (xSemaphoreTake(dacSem, portMAX_DELAY) == pdTRUE) self->dac.dac_write_point(p);
+      if (xSemaphoreTake(dacSem, pdMS_TO_TICKS(1)) == pdTRUE) {
+        self->dac.dac_write_point(p);
+      } else {
+        continue;
+      }
     }
   }
 }
@@ -103,5 +107,5 @@ void Renderer::begin() {
   timerAttachInterrupt(dacTimer, &timerISR, true);
 
   xTaskCreatePinnedToCore(SDTask, "SDTask", 8192, this, 2, NULL, 0);
-  xTaskCreatePinnedToCore(DACTask, "DACTask", 8192, this, 2, NULL, 1);
+  xTaskCreatePinnedToCore(DACTask, "DACTask", 8192, this, 5, NULL, 1);  // Priority 5 (higher)
 }
