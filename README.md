@@ -46,6 +46,11 @@ Although still in development and likely to contain bugs, it includes basic impl
 
 Contributions are welcome! Feel free to share improvements, optimizations, or custom firmware to help the community.
 
+## Wi-Fi and the setup access point
+- The board joins the network saved from the web page (or `wifi_credentials.h` if none is saved), and keeps retrying every 10 s for as long as it's powered. It doesn't matter whether the router comes up before or after the laser.
+- The setup access point (`ILDAWaveX16`, password `ildawave`, web page at `http://192.168.4.1`) only comes up when the board can't reach its network: right after boot if joining fails, or after the network has been gone for 60 s. It switches off again as soon as the board is connected.
+- Build flags change this: `SETUP_AP_PASSWORD`, `SETUP_AP_SSID`, `SETUP_AP_FALLBACK_MS`, `WIFI_RETRY_MS`, and `SETUP_AP_ALWAYS_ON=1` for the old always-on behaviour.
+
 ## Repository Contents
 - `pcb/` - Schematic, BOM  
 - `firmware/ILDAWaveX16` - ESP32-S3 source code (Arduino / PlatformIO)  

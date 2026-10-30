@@ -48,6 +48,33 @@ bool playlistLoaded = false;
 int currentIndex = -1;
 uint16_t oscPort = OSC_DEFAULT_PORT;
 
+// ---------------- Wi-Fi ----------------
+// The setup access point is only up while the laser can't reach the configured network:
+// at boot if joining fails, or after the network has been gone for SETUP_AP_FALLBACK_MS.
+// Once the station connection is up, the AP is switched off again, so nobody nearby can
+// join it and drive the laser from the web page during a show.
+// Override any of these with build flags, e.g. -D SETUP_AP_PASSWORD=\"something-else\"
+#ifndef SETUP_AP_SSID
+#define SETUP_AP_SSID "ILDAWaveX16"
+#endif
+#ifndef SETUP_AP_PASSWORD
+#define SETUP_AP_PASSWORD "ildawave"
+#endif
+#ifndef SETUP_AP_ALWAYS_ON
+#define SETUP_AP_ALWAYS_ON 0      // 1 = old behaviour: setup AP on all the time
+#endif
+#ifndef SETUP_AP_FALLBACK_MS
+#define SETUP_AP_FALLBACK_MS 60000 // Network gone this long -> setup AP comes back
+#endif
+#ifndef WIFI_RETRY_MS
+#define WIFI_RETRY_MS 10000        // How often to retry joining while disconnected
+#endif
+
+String staSsid;
+String staPassword;
+String mdnsName;
+bool mdnsStarted = false;
+
 // Function to add text to serial buffer for web display
 void addToSerialBuffer(String text) {
   for (int i = 0; i < text.length(); i++) {
@@ -283,46 +310,35 @@ void handleOsc(OSCServer& server, const OSCMessage& msg) {
   webSerialln(log);
 }
 
-void init_wifi() {
-  String ssid;
-  String password;
-  String mdns_name;
+bool setupApOn() {
+  wifi_mode_t mode = WiFi.getMode();
+  return mode == WIFI_AP || mode == WIFI_AP_STA;
+}
 
-  preferences.begin("app", false);
-  ssid = preferences.getString("ssid", "");
-  password = preferences.getString("password", "");
-  mdns_name = preferences.getString("mdns_name", "ildawavex16");
-  oscPort = preferences.getUShort("osc_port", OSC_DEFAULT_PORT);
-  preferences.end();
-
-  if (ssid == "" || password == ""){
-    ssid = WIFI_SSID;
-    password = WIFI_PASSWORD;
-  }
-
-  WiFi.mode(WIFI_AP_STA);
-
-  WiFi.softAP("ILDAWaveX16", "ildawave");
-  webSerial("AP IP address: ");
+void startSetupAp() {
+  if (setupApOn()) return;
+  WiFi.softAP(SETUP_AP_SSID, SETUP_AP_PASSWORD);
+  webSerial("Setup AP on: " SETUP_AP_SSID " at ");
   webSerialln(WiFi.softAPIP().toString());
+}
 
-  WiFi.begin(ssid, password);
-  webSerial("Connecting to WiFi");
+void stopSetupAp() {
+  if (SETUP_AP_ALWAYS_ON || !setupApOn()) return;
+  WiFi.softAPdisconnect(true);
+  webSerialln("Setup AP off (joined " + staSsid + ")");
+}
 
-  uint8_t attempts = 0;
-  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
-      delay(500);
-      webSerial(".");
-      attempts++;
-  }
-  if (WiFi.status() == WL_CONNECTED) {
-    webSerial("\nLocal IP: ");
-    webSerialln(WiFi.localIP().toString());
+// Runs every time the station connection comes up, not just at boot,
+// so mDNS works even if the network appeared after the laser was powered on.
+void onWifiConnected() {
+  webSerial("Local IP: ");
+  webSerialln(WiFi.localIP().toString());
 
-    // Start mDNS service
-    if (MDNS.begin(mdns_name.c_str())) {
+  if (!mdnsStarted) {
+    if (MDNS.begin(mdnsName.c_str())) {
+      mdnsStarted = true;
       webSerial("mDNS responder started: ");
-      webSerial(mdns_name);
+      webSerial(mdnsName);
       webSerialln(".local");
       MDNS.addService("http", "tcp", 80);
       MDNS.addService("osc", "udp", oscPort);
@@ -330,7 +346,79 @@ void init_wifi() {
       webSerialln("Error starting mDNS");
     }
   }
-  else webSerialln("\nWiFi Connection Failed!");
+  stopSetupAp();
+}
+
+// Keeps retrying the configured network for as long as the laser is on, and manages the setup AP.
+void wifi_loop(void* pvParameters) {
+  bool wasConnected = WiFi.status() == WL_CONNECTED;
+  unsigned long lastConnected = millis();
+  unsigned long lastRetry = millis();
+
+  while (1) {
+    unsigned long now = millis();
+    bool connected = WiFi.status() == WL_CONNECTED;
+
+    if (connected) {
+      lastConnected = now;
+      if (!wasConnected) onWifiConnected();
+    } else {
+      if (wasConnected) webSerialln("Wi-Fi lost, retrying every " + String(WIFI_RETRY_MS / 1000) + " s");
+
+      // Retrying makes the radio scan, which knocks setup-AP clients off.
+      // Don't retry while someone is on the setup page.
+      if (now - lastRetry >= WIFI_RETRY_MS && WiFi.softAPgetStationNum() == 0) {
+        lastRetry = now;
+        WiFi.disconnect();
+        WiFi.begin(staSsid.c_str(), staPassword.c_str());
+      }
+      if (now - lastConnected >= SETUP_AP_FALLBACK_MS) startSetupAp();
+    }
+    wasConnected = connected;
+    vTaskDelay(pdMS_TO_TICKS(500));
+  }
+}
+
+void init_wifi() {
+  preferences.begin("app", false);
+  staSsid = preferences.getString("ssid", "");
+  staPassword = preferences.getString("password", "");
+  mdnsName = preferences.getString("mdns_name", "ildawavex16");
+  oscPort = preferences.getUShort("osc_port", OSC_DEFAULT_PORT);
+  preferences.end();
+
+  if (staSsid == "" || staPassword == ""){
+    staSsid = WIFI_SSID;
+    staPassword = WIFI_PASSWORD;
+  }
+
+  WiFi.persistent(false);
+  WiFi.mode(SETUP_AP_ALWAYS_ON ? WIFI_AP_STA : WIFI_STA);
+  if (SETUP_AP_ALWAYS_ON) {
+    WiFi.softAP(SETUP_AP_SSID, SETUP_AP_PASSWORD);
+    webSerial("AP IP address: ");
+    webSerialln(WiFi.softAPIP().toString());
+  }
+
+  WiFi.begin(staSsid.c_str(), staPassword.c_str());
+  webSerial("Connecting to " + staSsid);
+
+  uint8_t attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+      delay(500);
+      webSerial(".");
+      attempts++;
+  }
+  webSerialln("");
+
+  if (WiFi.status() == WL_CONNECTED) {
+    onWifiConnected();
+  } else {
+    webSerialln("WiFi Connection Failed! Retrying in the background.");
+    startSetupAp();
+  }
+
+  xTaskCreatePinnedToCore(wifi_loop, "wifi_loop", 4096, NULL, 1, NULL, 0);
 }
 
 const char index_html[] PROGMEM = R"rawliteral(
